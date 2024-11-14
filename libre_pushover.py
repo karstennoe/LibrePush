@@ -94,44 +94,45 @@ def authenticate_with_retries(email, password, max_retries=5):
             raise e
 
     raise RuntimeError("Maximum retry attempts exceeded for authentication.")
-
+    
 if __name__ == "__main__":
     # Load configuration
     config = load_config('config.json')
 
-    send_pushover_notification(f"LibrePush process started", config['pushover_user_key'], config['pushover_api_token'], 1, "falling")
+    send_pushover_notification("LibrePush process started", config['pushover_user_key'], config['pushover_api_token'], 1, "falling")
 
-    # Connect to LibreLinkUp with retries
-    try:
-        lib_client = authenticate_with_retries(config['libre_email'], config['libre_password'])
+    while True:
+        try:
+            # Connect to LibreLinkUp with retries
+            lib_client = authenticate_with_retries(config['libre_email'], config['libre_password'])
 
-        # Track the last alert times
-        last_low_alert_time = None
-        last_high_alert_time = None
+            # Track the last alert times
+            last_low_alert_time = None
+            last_high_alert_time = None
 
-        # Continuous monitoring loop
-        while True:
-            try:
-                last_low_alert_time, last_high_alert_time = monitor_glucose(
-                    lib_client,
-                    config['pushover_user_key'],
-                    config['pushover_api_token'],
-                    last_low_alert_time,
-                    last_high_alert_time
-                )
-            except HTTPError as http_err:
-                if http_err.response.status_code == 429:
-                    print("Rate limit hit during glucose monitoring. Pausing for backoff.")
-                    time.sleep(60)  # Wait before retrying
-                else:
-                    print(f"HTTP error occurred: {http_err}")
-                    break
-            except Exception as e:
-                print(f"An unexpected error occurred during monitoring: {e}")
-                print(f"Trying to connect again")
-                lib_client = authenticate_with_retries(config['libre_email'], config['libre_password'])
-                break
+            # Continuous monitoring loop
+            while True:
+                try:
+                    last_low_alert_time, last_high_alert_time = monitor_glucose(
+                        lib_client,
+                        config['pushover_user_key'],
+                        config['pushover_api_token'],
+                        last_low_alert_time,
+                        last_high_alert_time
+                    )
+                except HTTPError as http_err:
+                    if http_err.response.status_code == 429:
+                        print("Rate limit hit during glucose monitoring. Pausing for backoff.")
+                        time.sleep(60)  # Wait before retrying
+                    else:
+                        print(f"HTTP error occurred: {http_err}. Reconnecting...")
+                        break  # Exit the inner loop to reconnect
+                except Exception as e:
+                    print(f"An unexpected error occurred during monitoring: {e}. Reconnecting...")
+                    break  # Exit the inner loop to reconnect
 
-            time.sleep(60)  # Wait before checking again
-    except RuntimeError as e:
-        print(e)
+                time.sleep(60)  # Wait before checking again
+
+        except Exception as e:
+            print(f"An error occurred while trying to authenticate or monitor: {e}. Retrying...")
+            time.sleep(60)  # Wait before trying to reconnect
