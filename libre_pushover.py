@@ -1,10 +1,14 @@
 import json
 import time
 from pushover_complete import PushoverAPI
-from pylibrelinkup import PyLibreLinkUp
+from pylibrelinkup import PyLibreLinkUp, APIUrl
 from datetime import datetime, timedelta
 import requests
 from requests.exceptions import HTTPError
+
+import tm1637
+import time
+from RPi import GPIO  # For controlling GPIO pins on the Raspberry Pi
 
 # Load configuration from the JSON file
 def load_config(filename):
@@ -33,8 +37,55 @@ def send_pushover_notification(message, user_key, api_token, priority=0, sound='
             priority=priority,  # Set the priority level
             sound=sound        # Set the custom sound
         )
+import tm1637
 
-def monitor_glucose(lib_client, user_key, api_token, last_low_alert_time, last_high_alert_time):
+# Define rotation states
+ROTATION_FRAMES = [0x40, 0x20, 0x01, 0x02]  # Corresponding to '-', '\', '|', '/'
+
+# Global rotation index
+rotation_index = 0
+
+def display_float(display, number):
+    """
+    Displays a float (0 to 30) with one decimal place on a 4-digit TM1637 display.
+    The number is right-justified. The first digit cycles through an animation for effect.
+    
+    :param display: TM1637 display object
+    :param number: Float number between 0 and 30
+    """
+    global rotation_index  # Use global counter to track animation state
+
+    # Ensure the number is within range
+    if number < 0 or number > 50:
+        return
+
+    # Format number with one decimal place
+    num_str = "{:.1f}".format(number).replace('.', '')  # Remove decimal for processing
+    digits = [int(d) for d in num_str]
+
+    # Create segment mappings
+    SEGMENTS = [0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F]  # 0-9
+    decimal_point = 0x80  # Bit for DP
+
+    # Select current rotation character
+    rotating_char = ROTATION_FRAMES[rotation_index]
+
+    # Update rotation index for next call
+    rotation_index = (rotation_index + 1) % len(ROTATION_FRAMES)
+
+    # Create segment data
+    if number < 10:
+        # Right-align a single-digit float (e.g., "4.5" → " 4.5")
+        display_data = [rotating_char, 0x00, SEGMENTS[digits[0]] | decimal_point, SEGMENTS[digits[1]]]
+    else:
+        # Right-align a two-digit float (e.g., "12.3" → "12.3")
+        display_data = [rotating_char, SEGMENTS[digits[0]], SEGMENTS[digits[1]] | decimal_point, SEGMENTS[digits[2]]]
+
+    # Write data to display
+    display.write(display_data)
+
+
+def monitor_glucose(lib_client, user_key, api_token, last_low_alert_time, last_high_alert_time, display):
     """Check glucose values from the LibreLinkUp client and send notifications if necessary."""
     patients = lib_client.get_patients()
     if not patients:
@@ -44,10 +95,18 @@ def monitor_glucose(lib_client, user_key, api_token, last_low_alert_time, last_h
     patient = patients[0]  # Assuming we're interested in the first patient
     glucose_data = lib_client.read(patient_identifier=patient.patient_id)
     current_glucose = glucose_data.current.value
+    
+    # Example: Display a number (4 digits)
+    print(f"{current_glucose}".replace(".",""))
+
+    # Example: Display a number (4 digits)
+    #display.show(f"{current_glucose}".replace(".",""))
+    #display.numbers(int(current_glucose), int((current_glucose-int(current_glucose))*100))
+    display_float(display, current_glucose)
 
     # Glucose level thresholds (modify as needed)
     LOW_THRESHOLD = 4.0  # mmol/L
-    HIGH_THRESHOLD = 12.0  # mmol/L
+    HIGH_THRESHOLD = 13.0  # mmol/L
 
     # Current time
     current_time = datetime.now()
@@ -55,20 +114,20 @@ def monitor_glucose(lib_client, user_key, api_token, last_low_alert_time, last_h
 
     if current_glucose < LOW_THRESHOLD:
         if not last_low_alert_time or (current_time - last_low_alert_time) > ten_minutes:
-            send_pushover_notification(f"Low glucose alert! Current level: {current_glucose} mmol/L.", user_key, api_token, 2, "falling")
+            #send_pushover_notification(f"Low glucose alert! Current level: {current_glucose} mmol/L.", user_key, api_token, 2, "falling")
             last_low_alert_time = current_time
         else:
             print("Low glucose alert suppressed to avoid repetition.")
     elif current_glucose > HIGH_THRESHOLD:
         if not last_high_alert_time or (current_time - last_high_alert_time) > ten_minutes:
-            send_pushover_notification(f"High glucose alert! Current level: {current_glucose} mmol/L.", user_key, api_token)
+            #send_pushover_notification(f"High glucose alert! Current level: {current_glucose} mmol/L.", user_key, api_token)
             last_high_alert_time = current_time
         else:
             print("High glucose alert suppressed to avoid repetition.")
     else:
         print(f"Glucose levels are normal: {current_glucose} mmol/L.")
 
-    return last_low_alert_time, last_high_alert_time
+    return last_low_alert_time, last_high_alert_time, current_glucose
 
 def authenticate_with_retries(email, password, max_retries=5):
     """Authenticate with LibreLinkUp with retry logic."""
@@ -99,10 +158,23 @@ if __name__ == "__main__":
     # Load configuration
     config = load_config('config.json')
 
-    send_pushover_notification("LibrePush process started", config['pushover_user_key'], config['pushover_api_token'], 1, "falling")
+    #send_pushover_notification("LibrePush process started", config['pushover_user_key'], config['pushover_api_token'], 1, "falling")
+
+    # Set up the CLK (Clock) and DIO (Data) pins
+    CLK_PIN = 3  # Replace with your CLK pin (GPIO number)
+    DIO_PIN = 2  # Replace with your DIO pin (GPIO number)
+
+    # Create an instance of the TM1637 class
+    display = tm1637.TM1637(clk=CLK_PIN, dio=DIO_PIN)
+
+    # Display brightness (optional, 0 to 7)
+    display.brightness(0)
+
+    display.write([0,0,0,0])
 
     while True:
         try:
+
             # Connect to LibreLinkUp with retries
             lib_client = authenticate_with_retries(config['libre_email'], config['libre_password'])
 
@@ -113,12 +185,13 @@ if __name__ == "__main__":
             # Continuous monitoring loop
             while True:
                 try:
-                    last_low_alert_time, last_high_alert_time = monitor_glucose(
+                    last_low_alert_time, last_high_alert_time, current_glucose = monitor_glucose(
                         lib_client,
                         config['pushover_user_key'],
                         config['pushover_api_token'],
                         last_low_alert_time,
-                        last_high_alert_time
+                        last_high_alert_time,
+                        display
                     )
                 except HTTPError as http_err:
                     if http_err.response.status_code == 429:
@@ -131,7 +204,10 @@ if __name__ == "__main__":
                     print(f"An unexpected error occurred during monitoring: {e}. Reconnecting...")
                     break  # Exit the inner loop to reconnect
 
-                time.sleep(60)  # Wait before checking again
+                time.sleep(1)  # Wait before checking again
+                for x in range(10):
+                    display_float(display, current_glucose)
+                    time.sleep(1)  # Wait before checking again
 
         except Exception as e:
             print(f"An error occurred while trying to authenticate or monitor: {e}. Retrying...")
