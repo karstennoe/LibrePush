@@ -5,10 +5,66 @@ from pylibrelinkup import PyLibreLinkUp, APIUrl
 from datetime import datetime, timedelta
 import requests
 from requests.exceptions import HTTPError
+from sound_test import play_alarm, setup_pwm
 
 import tm1637
 import time
 from RPi import GPIO  # For controlling GPIO pins on the Raspberry Pi
+import tm1637
+
+from gpiozero import Button
+
+
+# Glucose level thresholds (modify as needed)
+LOW_THRESHOLD = 4.0  # mmol/L
+HIGH_THRESHOLD = 13.0  # mmol/L
+VERY_LOW_THRESHOLD = 2.5  # mmol/L - non mutable
+
+
+pwm = setup_pwm()
+
+# Constants
+SPEAKER_PIN = 16  # GPIO pin where the piezo speaker is connected
+TONE_HIGH = 220  # Frequency of the high blood sugar alert tone in Hz
+TONE_LOW = 440    # Frequency of the low blood sugar alert tone in Hz
+TONE_VERY_LOW = 880    # Frequency of the low blood sugar alert tone in Hz
+DURATION = 0.6    # Duration of each tone in seconds
+REPEAT = 5    
+ALERT_REPEAT_TIME = timedelta(minutes=5)
+
+currently_muted = False
+
+current_glucose = -1
+
+# Define GPIO pins
+KEY_PIN = 14  # Connected to KEY
+
+HIGH_LEVEL_MUTE_TIME = 120
+LOW_LEVEL_MUTE_TIME = 5
+
+# Test overwrites
+#HIGH_LEVEL_MUTE_TIME = 1
+#LOW_LEVEL_MUTE_TIME = 1
+#LOW_THRESHOLD = 7.0  # mmol/L
+#HIGH_THRESHOLD = 13.0  # mmol/L
+#VERY_LOW_THRESHOLD = 2.5  # mmol/L - non mutable
+
+
+def button_press():
+    global currently_muted
+    global current_glucose
+    global mute_stop_time
+    print("Button Pressed!")
+    if current_glucose > HIGH_THRESHOLD:
+        print(f"Muting for {HIGH_LEVEL_MUTE_TIME} minutes!")
+        currently_muted = True
+        mute_stop_time = datetime.now() + timedelta(minutes=HIGH_LEVEL_MUTE_TIME)
+    if current_glucose < LOW_THRESHOLD:
+        print(f"Muting for {LOW_LEVEL_MUTE_TIME} minutes!")
+        currently_muted = True
+        mute_stop_time = datetime.now() + timedelta(minutes=LOW_LEVEL_MUTE_TIME)
+
+
 
 # Load configuration from the JSON file
 def load_config(filename):
@@ -37,7 +93,7 @@ def send_pushover_notification(message, user_key, api_token, priority=0, sound='
             priority=priority,  # Set the priority level
             sound=sound        # Set the custom sound
         )
-import tm1637
+
 
 # Define rotation states
 ROTATION_FRAMES = [0x40, 0x20, 0x01, 0x02]  # Corresponding to '-', '\', '|', '/'
@@ -55,6 +111,8 @@ def display_float(display, number):
     """
     global rotation_index  # Use global counter to track animation state
 
+    global currently_muted # Make a "mark" under "progress bar" if muted
+
     # Ensure the number is within range
     if number < 0 or number > 50:
         return
@@ -69,6 +127,10 @@ def display_float(display, number):
 
     # Select current rotation character
     rotating_char = ROTATION_FRAMES[rotation_index]
+
+    SEGMENT_D_MASK = 0x08  # Bit 3 controls the lowest LED (segment D)
+    if currently_muted:
+       rotating_char = rotating_char | SEGMENT_D_MASK  # Turn segment D ON
 
     # Update rotation index for next call
     rotation_index = (rotation_index + 1) % len(ROTATION_FRAMES)
@@ -87,6 +149,9 @@ def display_float(display, number):
 
 def monitor_glucose(lib_client, user_key, api_token, last_low_alert_time, last_high_alert_time, display):
     """Check glucose values from the LibreLinkUp client and send notifications if necessary."""
+    global current_glucose
+    global currently_muted
+    global pwm
     patients = lib_client.get_patients()
     if not patients:
         print("No patients found.")
@@ -104,22 +169,27 @@ def monitor_glucose(lib_client, user_key, api_token, last_low_alert_time, last_h
     #display.numbers(int(current_glucose), int((current_glucose-int(current_glucose))*100))
     display_float(display, current_glucose)
 
-    # Glucose level thresholds (modify as needed)
-    LOW_THRESHOLD = 4.0  # mmol/L
-    HIGH_THRESHOLD = 13.0  # mmol/L
 
     # Current time
     current_time = datetime.now()
-    ten_minutes = timedelta(minutes=10)
 
-    if current_glucose < LOW_THRESHOLD:
-        if not last_low_alert_time or (current_time - last_low_alert_time) > ten_minutes:
+    if current_glucose < VERY_LOW_THRESHOLD:
+        play_alarm(pwm, TONE_VERY_LOW, DURATION, REPEAT)
+        print("Very low level alarm tone played")
+    elif current_glucose < LOW_THRESHOLD:
+        if not last_low_alert_time or (current_time - last_low_alert_time) > ALERT_REPEAT_TIME:
             #send_pushover_notification(f"Low glucose alert! Current level: {current_glucose} mmol/L.", user_key, api_token, 2, "falling")
+            if not currently_muted:
+                play_alarm(pwm, TONE_LOW, DURATION, REPEAT)
+                print("Low level alarm tone played")
             last_low_alert_time = current_time
         else:
             print("Low glucose alert suppressed to avoid repetition.")
     elif current_glucose > HIGH_THRESHOLD:
-        if not last_high_alert_time or (current_time - last_high_alert_time) > ten_minutes:
+        if not last_high_alert_time or (current_time - last_high_alert_time) > ALERT_REPEAT_TIME:
+            if not currently_muted:
+                play_alarm(pwm, TONE_HIGH, DURATION, REPEAT)
+                print("High level alarm tone played")
             #send_pushover_notification(f"High glucose alert! Current level: {current_glucose} mmol/L.", user_key, api_token)
             last_high_alert_time = current_time
         else:
@@ -136,7 +206,7 @@ def authenticate_with_retries(email, password, max_retries=5):
 
     while retry_attempts < max_retries:
         try:
-            lib_client = PyLibreLinkUp(email=email, password=password)
+            lib_client = PyLibreLinkUp(email=email, password=password, api_url=APIUrl.EU)
             lib_client.authenticate()
             print("Successfully authenticated to LibreLinkUp.")
             return lib_client
@@ -172,9 +242,12 @@ if __name__ == "__main__":
 
     display.write([0,0,0,0])
 
+    mute_button = Button(KEY_PIN, pull_up=True)
+
+    mute_button.when_pressed = button_press
+
     while True:
         try:
-
             # Connect to LibreLinkUp with retries
             lib_client = authenticate_with_retries(config['libre_email'], config['libre_password'])
 
@@ -184,6 +257,10 @@ if __name__ == "__main__":
 
             # Continuous monitoring loop
             while True:
+                if currently_muted:
+                    if datetime.now() > mute_stop_time:
+                        currently_muted = False
+
                 try:
                     last_low_alert_time, last_high_alert_time, current_glucose = monitor_glucose(
                         lib_client,
