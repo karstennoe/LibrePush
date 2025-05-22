@@ -1,6 +1,6 @@
 import json
 import time
-from pushover_complete import PushoverAPI
+#from pushover_complete import PushoverAPI
 from pylibrelinkup import PyLibreLinkUp, APIUrl
 from datetime import datetime, timedelta
 import requests
@@ -9,11 +9,17 @@ from sound_test import play_alarm, setup_pwm
 
 import tm1637
 import time
-from RPi import GPIO  # For controlling GPIO pins on the Raspberry Pi
-import tm1637
+#from RPi import GPIO  # For controlling GPIO pins on the Raspberry Pi
+#import tm1637
+
+import subprocess
 
 from gpiozero import Button
 
+sounds = ['sounds/707800__scottyd0es__aeroce-tri-tone-text-alert.wav', 'sounds/216676__robinhood76__04864-notification-music-box.wav' , 'sounds/399190__spiceprogram__glockenspiel-brass-rolls.wav']
+
+def play_sound(index):
+    subprocess.run(['aplay', sounds[index]])
 
 # Glucose level thresholds (modify as needed)
 LOW_THRESHOLD = 4.0  # mmol/L
@@ -30,7 +36,7 @@ TONE_LOW = 440    # Frequency of the low blood sugar alert tone in Hz
 TONE_VERY_LOW = 880    # Frequency of the low blood sugar alert tone in Hz
 DURATION = 0.6    # Duration of each tone in seconds
 REPEAT = 5    
-ALERT_REPEAT_TIME = timedelta(minutes=5)
+ALERT_REPEAT_TIME = timedelta(minutes=0.5)
 
 currently_muted = False
 
@@ -138,10 +144,10 @@ def display_float(display, number):
     # Create segment data
     if number < 10:
         # Right-align a single-digit float (e.g., "4.5" → " 4.5")
-        display_data = [rotating_char, 0x00, SEGMENTS[digits[0]] | decimal_point, SEGMENTS[digits[1]]]
+        display_data = [0x00, SEGMENTS[digits[0]] | decimal_point, SEGMENTS[digits[1]], rotating_char]
     else:
         # Right-align a two-digit float (e.g., "12.3" → "12.3")
-        display_data = [rotating_char, SEGMENTS[digits[0]], SEGMENTS[digits[1]] | decimal_point, SEGMENTS[digits[2]]]
+        display_data = [SEGMENTS[digits[0]], SEGMENTS[digits[1]] | decimal_point, SEGMENTS[digits[2]], rotating_char]
 
     # Write data to display
     display.write(display_data)
@@ -175,12 +181,14 @@ def monitor_glucose(lib_client, user_key, api_token, last_low_alert_time, last_h
 
     if current_glucose < VERY_LOW_THRESHOLD:
         play_alarm(pwm, TONE_VERY_LOW, DURATION, REPEAT)
+        play_sound(0)
         print("Very low level alarm tone played")
     elif current_glucose < LOW_THRESHOLD:
         if not last_low_alert_time or (current_time - last_low_alert_time) > ALERT_REPEAT_TIME:
             #send_pushover_notification(f"Low glucose alert! Current level: {current_glucose} mmol/L.", user_key, api_token, 2, "falling")
             if not currently_muted:
                 play_alarm(pwm, TONE_LOW, DURATION, REPEAT)
+                play_sound(2)
                 print("Low level alarm tone played")
             last_low_alert_time = current_time
         else:
@@ -189,6 +197,7 @@ def monitor_glucose(lib_client, user_key, api_token, last_low_alert_time, last_h
         if not last_high_alert_time or (current_time - last_high_alert_time) > ALERT_REPEAT_TIME:
             if not currently_muted:
                 play_alarm(pwm, TONE_HIGH, DURATION, REPEAT)
+                play_sound(1)
                 print("High level alarm tone played")
             #send_pushover_notification(f"High glucose alert! Current level: {current_glucose} mmol/L.", user_key, api_token)
             last_high_alert_time = current_time
@@ -201,8 +210,8 @@ def monitor_glucose(lib_client, user_key, api_token, last_low_alert_time, last_h
 
 def authenticate_with_retries(email, password, max_retries=5):
     """Authenticate with LibreLinkUp with retry logic."""
-    retry_attempts = 0
-    backoff_time = 5  # Initial backoff time in seconds
+    retry_attempts = 1
+    backoff_time = 2  # Initial backoff time in seconds
 
     while retry_attempts < max_retries:
         try:
@@ -215,8 +224,13 @@ def authenticate_with_retries(email, password, max_retries=5):
                 print(f"Rate limit exceeded. Retrying in {backoff_time} seconds...")
                 time.sleep(backoff_time)
                 retry_attempts += 1
-                backoff_time *= 2  # Exponential backoff
+                backoff_time *= 1.5  # Exponential backoff
             else:
+                print(f"An http error occurred: {http_err}")
+                print(f"Retrying in {backoff_time} seconds...")
+                time.sleep(backoff_time)
+                retry_attempts += 1
+                backoff_time *= 1.5  # Exponential backoff
                 raise http_err
         except Exception as e:
             print(f"An unexpected error occurred: {e}")
@@ -225,6 +239,8 @@ def authenticate_with_retries(email, password, max_retries=5):
     raise RuntimeError("Maximum retry attempts exceeded for authentication.")
     
 if __name__ == "__main__":
+    play_sound(0)
+
     # Load configuration
     config = load_config('config.json')
 
