@@ -39,6 +39,10 @@ REPEAT = 5
 ALERT_REPEAT_TIME = timedelta(minutes=0.5)
 
 currently_muted = False
+muted_alert_type = None
+mute_stop_time = None
+low_mute_glucose = None
+previous_glucose = None
 
 current_glucose = -1
 
@@ -46,7 +50,9 @@ current_glucose = -1
 KEY_PIN = 14  # Connected to KEY
 
 HIGH_LEVEL_MUTE_TIME = 120
-LOW_LEVEL_MUTE_TIME = 5
+LOW_LEVEL_MUTE_TIME = 60
+LOW_FALLING_ALERT_DELTA = 0.2
+LOW_RECOVERY_DELTA = 0.1
 
 # Test overwrites
 #HIGH_LEVEL_MUTE_TIME = 1
@@ -60,15 +66,42 @@ def button_press():
     global currently_muted
     global current_glucose
     global mute_stop_time
+    global muted_alert_type
+    global low_mute_glucose
     print("Button Pressed!")
     if current_glucose > HIGH_THRESHOLD:
         print(f"Muting for {HIGH_LEVEL_MUTE_TIME} minutes!")
         currently_muted = True
+        muted_alert_type = "high"
+        low_mute_glucose = None
         mute_stop_time = datetime.now() + timedelta(minutes=HIGH_LEVEL_MUTE_TIME)
     if current_glucose < LOW_THRESHOLD:
         print(f"Muting for {LOW_LEVEL_MUTE_TIME} minutes!")
         currently_muted = True
+        muted_alert_type = "low"
+        low_mute_glucose = current_glucose
         mute_stop_time = datetime.now() + timedelta(minutes=LOW_LEVEL_MUTE_TIME)
+
+
+def clear_mute():
+    global currently_muted
+    global muted_alert_type
+    global mute_stop_time
+    global low_mute_glucose
+
+    currently_muted = False
+    muted_alert_type = None
+    mute_stop_time = None
+    low_mute_glucose = None
+
+
+def low_mute_should_break(current_value):
+    return (
+        currently_muted
+        and muted_alert_type == "low"
+        and low_mute_glucose is not None
+        and current_value <= low_mute_glucose - LOW_FALLING_ALERT_DELTA
+    )
 
 
 
@@ -157,6 +190,7 @@ def monitor_glucose(lib_client, user_key, api_token, last_low_alert_time, last_h
     """Check glucose values from the LibreLinkUp client and send notifications if necessary."""
     global current_glucose
     global currently_muted
+    global previous_glucose
     global pwm
     patients = lib_client.get_patients()
     if not patients:
@@ -165,7 +199,9 @@ def monitor_glucose(lib_client, user_key, api_token, last_low_alert_time, last_h
 
     patient = patients[0]  # Assuming we're interested in the first patient
     glucose_data = lib_client.read(patient_identifier=patient.patient_id)
+    last_glucose = previous_glucose
     current_glucose = glucose_data.current.value
+    previous_glucose = current_glucose
     
     # Example: Display a number (4 digits)
     print(f"{current_glucose}".replace(".",""))
@@ -183,27 +219,50 @@ def monitor_glucose(lib_client, user_key, api_token, last_low_alert_time, last_h
         play_alarm(pwm, TONE_VERY_LOW, DURATION, REPEAT)
         play_sound(0)
         print("Very low level alarm tone played")
+        last_low_alert_time = current_time
     elif current_glucose < LOW_THRESHOLD:
-        if not last_low_alert_time or (current_time - last_low_alert_time) > ALERT_REPEAT_TIME:
+        if currently_muted and muted_alert_type != "low":
+            clear_mute()
+
+        alert_due = not last_low_alert_time or (current_time - last_low_alert_time) > ALERT_REPEAT_TIME
+        recovering = last_glucose is not None and current_glucose >= last_glucose - LOW_RECOVERY_DELTA
+        mute_broken_by_fall = low_mute_should_break(current_glucose)
+
+        if mute_broken_by_fall:
+            print("Low glucose kept falling after mute; alarm re-enabled.")
+            clear_mute()
+
+        if alert_due or mute_broken_by_fall:
             #send_pushover_notification(f"Low glucose alert! Current level: {current_glucose} mmol/L.", user_key, api_token, 2, "falling")
-            if not currently_muted:
+            if currently_muted and muted_alert_type == "low":
+                print("Low glucose alert muted while values are not falling.")
+            elif recovering and last_low_alert_time:
+                print("Low glucose is flat or rising; repeat alarm suppressed.")
+            else:
                 play_alarm(pwm, TONE_LOW, DURATION, REPEAT)
                 play_sound(2)
                 print("Low level alarm tone played")
-            last_low_alert_time = current_time
+                last_low_alert_time = current_time
         else:
             print("Low glucose alert suppressed to avoid repetition.")
     elif current_glucose > HIGH_THRESHOLD:
+        if currently_muted and muted_alert_type != "high":
+            clear_mute()
+
         if not last_high_alert_time or (current_time - last_high_alert_time) > ALERT_REPEAT_TIME:
             if not currently_muted:
                 play_alarm(pwm, TONE_HIGH, DURATION, REPEAT)
                 play_sound(1)
                 print("High level alarm tone played")
+            else:
+                print("High glucose alert muted.")
             #send_pushover_notification(f"High glucose alert! Current level: {current_glucose} mmol/L.", user_key, api_token)
             last_high_alert_time = current_time
         else:
             print("High glucose alert suppressed to avoid repetition.")
     else:
+        if currently_muted and muted_alert_type == "low":
+            clear_mute()
         print(f"Glucose levels are normal: {current_glucose} mmol/L.")
 
     return last_low_alert_time, last_high_alert_time, current_glucose
@@ -275,7 +334,7 @@ if __name__ == "__main__":
             while True:
                 if currently_muted:
                     if datetime.now() > mute_stop_time:
-                        currently_muted = False
+                        clear_mute()
 
                 try:
                     last_low_alert_time, last_high_alert_time, current_glucose = monitor_glucose(

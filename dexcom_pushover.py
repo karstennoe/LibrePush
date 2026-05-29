@@ -14,8 +14,10 @@ LOW_THRESHOLD = 4.0
 HIGH_THRESHOLD = 13.0
 VERY_LOW_THRESHOLD = 2.5
 HIGH_LEVEL_MUTE_TIME = 120
-LOW_LEVEL_MUTE_TIME = 5
-ALERT_REPEAT_TIME = timedelta(minutes=0.5)
+LOW_LEVEL_MUTE_TIME = 60
+LOW_FALLING_ALERT_DELTA = 0.5
+LOW_RECOVERY_DELTA = 0.1
+ALERT_REPEAT_TIME = timedelta(minutes=5)
 
 SPEAKER_PIN = 16
 TONE_HIGH = 220
@@ -42,6 +44,10 @@ def load_config(filename):
 ROTATION_FRAMES = [0x40, 0x20, 0x01, 0x02]
 rotation_index = 0
 currently_muted = False
+muted_alert_type = None
+mute_stop_time = None
+low_mute_glucose = None
+previous_glucose = None
 current_glucose = -1
 
 
@@ -64,10 +70,12 @@ def display_float(display, number):
     display.write(display_data)
 
 def monitor_glucose_dexcom(dexcom_client, last_low_alert_time, last_high_alert_time, display):
-    global current_glucose, currently_muted, pwm
+    global current_glucose, currently_muted, previous_glucose, pwm
 
     glucose_reading = dexcom_client.get_current_glucose_reading()
+    last_glucose = previous_glucose
     current_glucose = glucose_reading.mmol_l
+    previous_glucose = current_glucose
     print(f"Current glucose: {current_glucose} mmol/L")
     display_float(display, current_glucose)
 
@@ -76,32 +84,75 @@ def monitor_glucose_dexcom(dexcom_client, last_low_alert_time, last_high_alert_t
     if current_glucose < VERY_LOW_THRESHOLD:
         play_alarm(pwm, TONE_VERY_LOW, DURATION, REPEAT)
         play_sound(0)
+        last_low_alert_time = now
     elif current_glucose < LOW_THRESHOLD:
-        if not last_low_alert_time or (now - last_low_alert_time) > ALERT_REPEAT_TIME:
-            if not currently_muted:
+        if currently_muted and muted_alert_type != "low":
+            clear_mute()
+
+        alert_due = not last_low_alert_time or (now - last_low_alert_time) > ALERT_REPEAT_TIME
+        recovering = last_glucose is not None and current_glucose >= last_glucose - LOW_RECOVERY_DELTA
+        mute_broken_by_fall = low_mute_should_break(current_glucose)
+
+        if mute_broken_by_fall:
+            print("Low glucose kept falling after mute; alarm re-enabled.")
+            clear_mute()
+
+        if alert_due or mute_broken_by_fall:
+            if currently_muted and muted_alert_type == "low":
+                print("Low glucose alert muted while values are not falling.")
+            elif recovering and last_low_alert_time:
+                print("Low glucose is flat or rising; repeat alarm suppressed.")
+            else:
                 play_alarm(pwm, TONE_LOW, DURATION, REPEAT)
                 play_sound(2)
-            last_low_alert_time = now
+                last_low_alert_time = now
     elif current_glucose > HIGH_THRESHOLD:
+        if currently_muted and muted_alert_type != "high":
+            clear_mute()
+
         if not last_high_alert_time or (now - last_high_alert_time) > ALERT_REPEAT_TIME:
             if not currently_muted:
                 play_alarm(pwm, TONE_HIGH, DURATION, REPEAT)
                 play_sound(1)
+            else:
+                print("High glucose alert muted.")
             last_high_alert_time = now
     else:
+        if currently_muted and muted_alert_type == "low":
+            clear_mute()
         print("Glucose is within normal range.")
 
     return last_low_alert_time, last_high_alert_time, current_glucose
 
+def clear_mute():
+    global currently_muted, muted_alert_type, mute_stop_time, low_mute_glucose
+
+    currently_muted = False
+    muted_alert_type = None
+    mute_stop_time = None
+    low_mute_glucose = None
+
+def low_mute_should_break(current_value):
+    return (
+        currently_muted
+        and muted_alert_type == "low"
+        and low_mute_glucose is not None
+        and current_value <= low_mute_glucose - LOW_FALLING_ALERT_DELTA
+    )
+
 def button_press():
-    global currently_muted, current_glucose, mute_stop_time
+    global currently_muted, current_glucose, mute_stop_time, muted_alert_type, low_mute_glucose
     print("Button Pressed!")
     if current_glucose > HIGH_THRESHOLD:
         currently_muted = True
+        muted_alert_type = "high"
+        low_mute_glucose = None
         mute_stop_time = datetime.now() + timedelta(minutes=HIGH_LEVEL_MUTE_TIME)
         print("High alert muted.")
     elif current_glucose < LOW_THRESHOLD:
         currently_muted = True
+        muted_alert_type = "low"
+        low_mute_glucose = current_glucose
         mute_stop_time = datetime.now() + timedelta(minutes=LOW_LEVEL_MUTE_TIME)
         print("Low alert muted.")
 
@@ -132,7 +183,7 @@ if __name__ == "__main__":
 
             while True:
                 if currently_muted and datetime.now() > mute_stop_time:
-                    currently_muted = False
+                    clear_mute()
 
                 try:
                     last_low_alert_time, last_high_alert_time, current_glucose = monitor_glucose_dexcom(
